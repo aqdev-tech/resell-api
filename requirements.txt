@@ -8,3 +8,4 @@ bcrypt==3.2.0
 pytest
 httpx
 pydantic
+gunicorn
