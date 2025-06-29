@@ -494,6 +494,10 @@ async def bulk_update_listings(
     db.commit()
     return {"status": f"updated {listings.count()} listings to {bulk_action.action.value}"}
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn
