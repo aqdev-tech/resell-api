@@ -12,18 +12,30 @@ import os
 import shutil
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+import uuid
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
 
-# --- Configuration ---
-DATABASE_URL = "sqlite:///./reselling.db"
-SECRET_KEY = "a_very_secret_key_that_should_be_in_env_vars"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+load_dotenv()
+
+class Settings(BaseSettings):
+    DATABASE_URL: str
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+
 UPLOAD_DIR = "uploads"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- SQLAlchemy Setup ---
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(settings.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -49,6 +61,10 @@ class ListingStatus(str, enum.Enum):
     DELETED = "deleted" # Soft delete
 
 # --- Database Models ---
+class AdminRole(str, enum.Enum):
+    SUPER_ADMIN = "super_admin"
+    ADMIN = "admin"
+
 class GadgetListing(Base):
     __tablename__ = "gadgets"
     id = Column(Integer, primary_key=True, index=True)
@@ -61,12 +77,15 @@ class GadgetListing(Base):
     seller_contact_info = Column(String)
     status = Column(Enum(ListingStatus), default=ListingStatus.PENDING)
     photo_url = Column(String)
+    video_url = Column(String, nullable=True)
 
 class Admin(Base):
     __tablename__ = "admins"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    role = Column(Enum(AdminRole, native_enum=False), default=AdminRole.ADMIN)
+    is_active = Column(Boolean, default=True)
 
 class BuyerQuestion(Base):
     __tablename__ = "questions"
@@ -97,6 +116,7 @@ class GadgetUpdate(BaseModel):
     description: Optional[str] = None
     seller_price: Optional[float] = None
     listing_price: Optional[float] = None
+    video_url: Optional[str] = None
 
 
 class GadgetRequestSubmission(BaseModel):
@@ -143,6 +163,7 @@ class Gadget(BaseModel):
     seller_price: float
     listing_price: Optional[float] = None
     photo_url: str
+    video_url: Optional[str] = None
     status: ListingStatus
     seller_contact_info: str
     class Config:
@@ -156,6 +177,7 @@ class PublicGadget(BaseModel):
     description: str
     listing_price: float
     photo_url: str
+    video_url: Optional[str] = None
     status: ListingStatus
     admin_whatsapp_number: Optional[str] = None
     class Config:
@@ -170,6 +192,28 @@ class AdminDashboard(BaseModel):
 
 class AdminSettings(BaseModel):
     whatsapp_number: str
+
+class AdminCreate(BaseModel):
+    username: str
+    password: str
+    role: AdminRole = AdminRole.ADMIN
+
+class AdminUpdate(BaseModel):
+    username: Optional[str] = None
+    role: Optional[AdminRole] = None
+    is_active: Optional[bool] = None
+
+class AdminOut(BaseModel):
+    id: int
+    username: str
+    role: AdminRole
+    is_active: bool
+    class Config:
+        from_attributes = True
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
 
 class Token(BaseModel):
     access_token: str
@@ -196,9 +240,9 @@ def verify_password(plain_password, hashed_password):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 async def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
@@ -207,16 +251,24 @@ async def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = D
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
     except JWTError:
         raise credentials_exception
     admin = db.query(Admin).filter(Admin.username == username).first()
-    if admin is None:
+    if admin is None or not admin.is_active:
         raise credentials_exception
     return admin
+
+async def get_super_admin(current_admin: Admin = Depends(get_current_admin)):
+    if current_admin.role != AdminRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to perform this action.",
+        )
+    return current_admin
 
 def get_admin_whatsapp(db: Session):
     setting = db.query(Setting).filter(Setting.key == "whatsapp_number").first()
@@ -230,6 +282,57 @@ app.add_middleware(
 )
 
 # --- API Endpoints ---
+
+@app.post("/admin/manage/admins", response_model=AdminOut, dependencies=[Depends(get_super_admin)])
+async def create_admin(admin_data: AdminCreate, db: Session = Depends(get_db)):
+    if db.query(Admin).filter(Admin.username == admin_data.username).first():
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = get_password_hash(admin_data.password)
+    db_admin = Admin(
+        username=admin_data.username,
+        hashed_password=hashed_password,
+        role=admin_data.role,
+    )
+    db.add(db_admin)
+    db.commit()
+    db.refresh(db_admin)
+    return db_admin
+
+@app.get("/admin/manage/admins", response_model=List[AdminOut], dependencies=[Depends(get_super_admin)])
+async def list_admins(db: Session = Depends(get_db)):
+    return db.query(Admin).all()
+
+@app.put("/admin/manage/admins/{admin_id}", response_model=AdminOut, dependencies=[Depends(get_super_admin)])
+async def update_admin(admin_id: int, admin_data: AdminUpdate, db: Session = Depends(get_db)):
+    db_admin = db.query(Admin).filter(Admin.id == admin_id).first()
+    if not db_admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+
+    if admin_data.username and db.query(Admin).filter(Admin.username == admin_data.username).first():
+        raise HTTPException(status_code=400, detail="Username already taken")
+
+    update_data = admin_data.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_admin, key, value)
+    
+    db.commit()
+    db.refresh(db_admin)
+    return db_admin
+
+@app.patch("/admin/change-password")
+async def change_password(
+    password_data: PasswordChange,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+):
+    if not verify_password(password_data.current_password, current_admin.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+    
+    current_admin.hashed_password = get_password_hash(password_data.new_password)
+    db.commit()
+    return {"status": "password updated successfully"}
+
 @app.post("/seller/submit", response_model=Gadget)
 async def submit_gadget(
     name: str,
@@ -239,11 +342,24 @@ async def submit_gadget(
     seller_price: float,
     seller_contact_info: str,
     photo: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
-    file_path = os.path.join(UPLOAD_DIR, photo.filename)
-    with open(file_path, "wb") as buffer:
+    # Generate unique filenames
+    photo_ext = os.path.splitext(photo.filename)[1]
+    photo_filename = f"{uuid.uuid4()}{photo_ext}"
+    photo_path = os.path.join(UPLOAD_DIR, photo_filename)
+
+    with open(photo_path, "wb") as buffer:
         shutil.copyfileobj(photo.file, buffer)
+
+    video_filename = None
+    if video:
+        video_ext = os.path.splitext(video.filename)[1]
+        video_filename = f"{uuid.uuid4()}{video_ext}"
+        video_path = os.path.join(UPLOAD_DIR, video_filename)
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
 
     gadget_data = {
         "name": name,
@@ -252,7 +368,8 @@ async def submit_gadget(
         "description": description,
         "seller_price": seller_price,
         "seller_contact_info": seller_contact_info,
-        "photo_url": f"/uploads/{photo.filename}",
+        "photo_url": f"/uploads/{photo_filename}",
+        "video_url": f"/uploads/{video_filename}" if video else None,
         "status": ListingStatus.PENDING,
     }
 
@@ -283,12 +400,25 @@ async def add_listing(
     listing_price: float,
     seller_contact_info: str,
     photo: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     current_admin: Admin = Depends(get_current_admin),
 ):
-    file_path = os.path.join(UPLOAD_DIR, photo.filename)
-    with open(file_path, "wb") as buffer:
+    # Generate unique filenames
+    photo_ext = os.path.splitext(photo.filename)[1]
+    photo_filename = f"{uuid.uuid4()}{photo_ext}"
+    photo_path = os.path.join(UPLOAD_DIR, photo_filename)
+
+    with open(photo_path, "wb") as buffer:
         shutil.copyfileobj(photo.file, buffer)
+
+    video_filename = None
+    if video:
+        video_ext = os.path.splitext(video.filename)[1]
+        video_filename = f"{uuid.uuid4()}{video_ext}"
+        video_path = os.path.join(UPLOAD_DIR, video_filename)
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
 
     gadget_data = {
         "name": name,
@@ -298,7 +428,8 @@ async def add_listing(
         "seller_price": seller_price,
         "listing_price": listing_price,
         "seller_contact_info": seller_contact_info,
-        "photo_url": f"/uploads/{photo.filename}",
+        "photo_url": f"/uploads/{photo_filename}",
+        "video_url": f"/uploads/{video_filename}" if video else None,
         "status": ListingStatus.AVAILABLE,
     }
 

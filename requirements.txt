@@ -9,3 +9,6 @@ pytest
 httpx
 pydantic
 gunicorn
+python-dotenv
+psycopg2-binary
+alembic
